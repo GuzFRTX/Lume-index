@@ -23,6 +23,26 @@ export function initDb() {
   db.prepare(`CREATE INDEX IF NOT EXISTS idx_files_name ON files(name)`).run();
   db.prepare(`CREATE INDEX IF NOT EXISTS idx_files_extension ON files(extension)`).run();
   db.prepare(`CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)`).run();
+  db.prepare(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+      name,
+      path,
+      extension UNINDEXED,
+      size UNINDEXED,
+      modified_at UNINDEXED
+    )
+  `).run();
+
+  const filesCount = db.prepare(`SELECT COUNT(*) AS count FROM files`).get().count;
+  const ftsCount = db.prepare(`SELECT COUNT(*) AS count FROM files_fts`).get().count;
+
+  if (filesCount > 0 && ftsCount === 0) {
+    db.prepare(`
+      INSERT INTO files_fts (name, path, extension, size, modified_at)
+      SELECT name, path, extension, size, modified_at
+      FROM files
+    `).run();
+  }
 }
 
 const insertFileStatement = () =>
@@ -32,18 +52,35 @@ const insertFileStatement = () =>
     VALUES (?, ?, ?, ?, ?)
   `);
 
-export function replaceFiles(files) {
-  const insertFile = insertFileStatement();
+const insertFtsStatement = () =>
+  db.prepare(`
+    INSERT INTO files_fts
+    (name, path, extension, size, modified_at)
+    VALUES (?, ?, ?, ?, ?)
+  `);
 
-  const replaceAll = db.transaction((nextFiles) => {
+export function resetFiles() {
+  db.transaction(() => {
     db.prepare(`DELETE FROM files`).run();
+    db.prepare(`DELETE FROM files_fts`).run();
+  })();
+}
 
+export function insertFiles(files) {
+  const insertFile = insertFileStatement();
+  const insertFts = insertFtsStatement();
+
+  db.transaction((nextFiles) => {
     for (const file of nextFiles) {
       insertFile.run(file.name, file.path, file.extension, file.size, file.modifiedAt);
+      insertFts.run(file.name, file.path, file.extension, file.size, file.modifiedAt);
     }
-  });
+  })(files);
+}
 
-  replaceAll(files);
+export function replaceFiles(files) {
+  resetFiles();
+  insertFiles(files);
 }
 
 function escapeLike(value) {
@@ -61,9 +98,39 @@ function buildSearchPattern(query, fuzzySearch) {
   return `%${[...escapedQuery].join("%")}%`;
 }
 
+function escapeFtsToken(value) {
+  return value.replace(/"/g, "").replace(/[^\p{L}\p{N}_-]+/gu, " ").trim();
+}
+
+function buildFtsQuery(query) {
+  const tokens = escapeFtsToken(query)
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 8);
+
+  if (tokens.length === 0) return "";
+  return tokens.map((token) => `"${token}"*`).join(" AND ");
+}
+
 export function searchFiles(query, options = {}) {
-  const clauses = ["name LIKE @pattern ESCAPE '\\'"];
+  const normalizedQuery = query.trim();
   const limit = Math.min(Math.max(Number(options.maxResults) || 100, 1), 500);
+
+  if (normalizedQuery && !options.fuzzySearch) {
+    const ftsQuery = buildFtsQuery(normalizedQuery);
+
+    if (ftsQuery) {
+      return db.prepare(`
+        SELECT name, path, extension, size, modified_at
+        FROM files_fts
+        WHERE files_fts MATCH @query
+        ORDER BY rank
+        LIMIT @limit
+      `).all({ query: ftsQuery, limit });
+    }
+  }
+
+  const clauses = ["name LIKE @pattern ESCAPE '\\'"];
   const params = {
     pattern: buildSearchPattern(query, options.fuzzySearch),
     limit,

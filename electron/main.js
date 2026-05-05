@@ -1,9 +1,9 @@
 import { app, BrowserWindow, ipcMain, dialog, shell } from "electron";
-import fs from "node:fs";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { fileURLToPath } from "node:url";
-import { initDb, isIndexedPath, replaceFiles, searchFiles } from "./database.js";
+import { initDb, insertFiles, isIndexedPath, resetFiles, searchFiles } from "./database.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,7 +16,16 @@ const imageMimeTypes = new Map([
   [".bmp", "image/bmp"],
   [".avif", "image/avif"],
 ]);
-const defaultMaxPreviewMb = 15;
+const videoMimeTypes = new Map([
+  [".mp4", "video/mp4"],
+  [".webm", "video/webm"],
+  [".ogg", "video/ogg"],
+  [".ogv", "video/ogg"],
+  [".mov", "video/quicktime"],
+  [".m4v", "video/mp4"],
+]);
+const defaultMaxPreviewMb = 5;
+const indexBatchSize = 500;
 
 let mainWindow;
 
@@ -94,10 +103,18 @@ function shouldIgnoreEntry(entry, options) {
   return !options.includeHidden && isHiddenName(entry.name);
 }
 
-async function scanFolder(folderPath, rawOptions = {}) {
+async function scanFolder(folderPath, rawOptions = {}, onBatch = () => {}) {
   const options = createIndexOptions(rawOptions);
   const visitedDirectories = new Set();
-  const files = [];
+  let files = [];
+  let total = 0;
+
+  function flushBatch() {
+    if (files.length === 0) return;
+    total += files.length;
+    onBatch(files, total);
+    files = [];
+  }
 
   async function walk(dir) {
     let entries;
@@ -137,6 +154,10 @@ async function scanFolder(folderPath, rawOptions = {}) {
             size: stats.size,
             modifiedAt: stats.mtime.toISOString(),
           });
+
+          if (files.length >= indexBatchSize) {
+            flushBatch();
+          }
         }
       } catch (error) {
         console.warn(`Could not stat file: ${fullPath}`, error);
@@ -145,7 +166,8 @@ async function scanFolder(folderPath, rawOptions = {}) {
   }
 
   await walk(folderPath);
-  return files;
+  flushBatch();
+  return total;
 }
 
 function createSearchOptions(options = {}) {
@@ -173,11 +195,14 @@ ipcMain.handle("index-folder", async (_, folderPath, options) => {
   const stats = await fsp.stat(folderPath);
   if (!stats.isDirectory()) throw new Error("Selected path is not a directory");
 
-  const files = await scanFolder(folderPath, options);
-  replaceFiles(files);
+  resetFiles();
+  const total = await scanFolder(folderPath, options, (files, indexedTotal) => {
+    insertFiles(files);
+    mainWindow?.webContents.send("index-progress", { total: indexedTotal });
+  });
 
   return {
-    total: files.length,
+    total,
   };
 });
 
@@ -185,33 +210,48 @@ ipcMain.handle("search-files", async (_, query, options) => {
   return searchFiles(query, createSearchOptions(options));
 });
 
-ipcMain.handle("get-image-preview", async (_, filePath, options) => {
+ipcMain.handle("get-media-preview", async (_, filePath, options) => {
   assertIndexedPath(filePath);
 
   const extension = path.extname(filePath).toLowerCase();
-  const mimeType = imageMimeTypes.get(extension);
+  const imageMimeType = imageMimeTypes.get(extension);
+  const videoMimeType = videoMimeTypes.get(extension);
   const { maxPreviewBytes } = createPreviewOptions(options);
 
-  if (!mimeType) {
+  if (!imageMimeType && !videoMimeType) {
     return null;
   }
 
   try {
-    const stats = fs.statSync(filePath);
+    const stats = await fsp.stat(filePath);
 
-    if (!stats.isFile() || stats.size > maxPreviewBytes) {
+    if (!stats.isFile()) {
       return null;
     }
 
-    const buffer = fs.readFileSync(filePath);
+    if (videoMimeType) {
+      return {
+        kind: "video",
+        src: pathToFileURL(filePath).toString(),
+        mimeType: videoMimeType,
+        size: stats.size,
+      };
+    }
+
+    if (stats.size > maxPreviewBytes) {
+      return null;
+    }
+
+    const buffer = await fsp.readFile(filePath);
 
     return {
-      src: `data:${mimeType};base64,${buffer.toString("base64")}`,
-      mimeType,
+      kind: "image",
+      src: `data:${imageMimeType};base64,${buffer.toString("base64")}`,
+      mimeType: imageMimeType,
       size: stats.size,
     };
   } catch (error) {
-    console.warn(`Could not create image preview: ${filePath}`, error);
+    console.warn(`Could not create media preview: ${filePath}`, error);
     return null;
   }
 });

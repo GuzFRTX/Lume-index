@@ -4,6 +4,7 @@ import {
   Database,
   ExternalLink,
   FileSearch,
+  FileVideo,
   Folder,
   FolderOpen,
   Gauge,
@@ -22,6 +23,8 @@ import './App.css'
 
 const indexer = window.fileIndexer
 const imageExtensions = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.avif'])
+const videoExtensions = new Set(['.mp4', '.webm', '.ogg', '.ogv', '.mov', '.m4v'])
+const previewExtensions = new Set([...imageExtensions, ...videoExtensions])
 const settingsSections = [
   { id: 'appearance', label: 'Aparência', icon: Palette },
   { id: 'indexing', label: 'Indexação', icon: Database },
@@ -38,12 +41,12 @@ const defaultPreferences = {
   accentColor: '#7c3aed',
   includeHidden: false,
   followShortcuts: false,
-  indexedExtensions: 'pdf, docx, xlsx, png, jpg, jpeg, webp, txt, md',
-  fuzzySearch: true,
+  indexedExtensions: 'pdf, docx, xlsx, png, jpg, jpeg, webp, mp4, webm, mov, m4v, txt, md',
+  fuzzySearch: false,
   searchPaths: true,
   maxResults: 100,
   searchDelay: 180,
-  previewMaxMb: 15,
+  previewMaxMb: 5,
   excludedPatterns: 'node_modules\n.git\nAppData\nWindows\nProgram Files',
 }
 
@@ -293,7 +296,7 @@ function App() {
   const [folderPath, setFolderPath] = useState('')
   const [query, setQuery] = useState('')
   const [results, setResults] = useState([])
-  const [imagePreviews, setImagePreviews] = useState({})
+  const [mediaPreviews, setMediaPreviews] = useState({})
   const [selectedPreview, setSelectedPreview] = useState(null)
   const [status, setStatus] = useState('Nenhuma pasta indexada')
   const [isIndexing, setIsIndexing] = useState(false)
@@ -357,7 +360,7 @@ function App() {
 
     setIsIndexing(true)
     setStatus('Indexando arquivos')
-    setImagePreviews({})
+    setMediaPreviews({})
     setSelectedPreview(null)
 
     try {
@@ -397,25 +400,41 @@ function App() {
   useEffect(() => {
     if (!canUseIndexer) return
 
-    let isCurrent = true
-    const imageFiles = results
-      .filter((file) => imageExtensions.has(file.extension))
-      .filter((file) => imagePreviews[file.path]?.cacheKey !== getPreviewCacheKey(file))
-      .slice(0, 24)
+    return indexer.onIndexProgress?.((payload) => {
+      if (typeof payload?.total === 'number') {
+        setIndexedTotal(payload.total)
+        setStatus(`${payload.total} arquivos encontrados`)
+      }
+    })
+  }, [canUseIndexer])
 
-    if (imageFiles.length === 0) return
+  useEffect(() => {
+    if (!canUseIndexer) return
+
+    let isCurrent = true
+    const mediaFiles = results
+      .filter((file) => previewExtensions.has(file.extension))
+      .filter((file) => mediaPreviews[file.path]?.cacheKey !== getPreviewCacheKey(file))
+      .slice(0, 12)
+
+    if (mediaFiles.length === 0) return
 
     async function loadPreviews() {
-      const loadedPreviews = await Promise.all(
-        imageFiles.map(async (file) => {
-          const preview = await indexer.getImagePreview(file.path, previewOptions)
-          return [file.path, { cacheKey: getPreviewCacheKey(file), preview }]
-        }),
-      )
+      const loadedPreviews = []
+      const workers = Array.from({ length: Math.min(3, mediaFiles.length) }, async (_, workerIndex) => {
+        for (let index = workerIndex; index < mediaFiles.length; index += 3) {
+          const file = mediaFiles[index]
+          const preview = await indexer.getMediaPreview(file.path, previewOptions)
+          if (!isCurrent) return
+          loadedPreviews.push([file.path, { cacheKey: getPreviewCacheKey(file), preview }])
+        }
+      })
+
+      await Promise.all(workers)
 
       if (!isCurrent) return
 
-      setImagePreviews((currentPreviews) => {
+      setMediaPreviews((currentPreviews) => {
         const nextPreviews = { ...currentPreviews }
 
         for (const [filePath, previewEntry] of loadedPreviews) {
@@ -434,10 +453,10 @@ function App() {
     return () => {
       isCurrent = false
     }
-  }, [canUseIndexer, getPreviewCacheKey, imagePreviews, previewOptions, results])
+  }, [canUseIndexer, getPreviewCacheKey, mediaPreviews, previewOptions, results])
 
   function openPreview(file) {
-    const preview = imagePreviews[file.path]?.preview
+    const preview = mediaPreviews[file.path]?.preview
 
     if (preview?.src) {
       setSelectedPreview({ file, preview })
@@ -449,7 +468,29 @@ function App() {
   }
 
   function getPreview(file) {
-    return imagePreviews[file.path]?.preview
+    return mediaPreviews[file.path]?.preview
+  }
+
+  function renderThumb(file) {
+    const preview = getPreview(file)
+
+    if (!preview?.src || !preferences.showThumbnails) {
+      return videoExtensions.has(file.extension) ? <FileVideo size={20} aria-hidden="true" /> : <Image size={20} aria-hidden="true" />
+    }
+
+    if (preview.kind === 'video') {
+      return <video src={preview.src} muted preload="metadata" />
+    }
+
+    return <img src={preview.src} alt="" loading="lazy" />
+  }
+
+  function renderPreview() {
+    if (selectedPreview.preview.kind === 'video') {
+      return <video src={selectedPreview.preview.src} controls autoPlay />
+    }
+
+    return <img src={selectedPreview.preview.src} alt={selectedPreview.file.name} />
   }
 
   return (
@@ -584,13 +625,9 @@ function App() {
                       type="button"
                       onClick={() => openPreview(file)}
                       disabled={!getPreview(file)?.src || !preferences.showThumbnails}
-                      title={imageExtensions.has(file.extension) ? 'Visualizar imagem' : 'Previa indisponivel'}
+                      title={previewExtensions.has(file.extension) ? 'Visualizar mídia' : 'Previa indisponivel'}
                     >
-                      {getPreview(file)?.src && preferences.showThumbnails ? (
-                        <img src={getPreview(file).src} alt="" />
-                      ) : (
-                        <Image size={20} aria-hidden="true" />
-                      )}
+                      {renderThumb(file)}
                     </button>
                     <div className="file-main">
                       <p className="file-name">{file.name}</p>
@@ -683,7 +720,7 @@ function App() {
             </header>
 
             <div className="preview-stage">
-              <img src={selectedPreview.preview.src} alt={selectedPreview.file.name} />
+              {renderPreview()}
             </div>
 
             <footer className="preview-footer">
