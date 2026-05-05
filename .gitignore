@@ -13,8 +13,7 @@ dist-ssr
 *.local
 
 # Build artifacts
-packages/
-packages-final/
+packages*/
 release/
 *.blockmap
 

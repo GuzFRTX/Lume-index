@@ -17,8 +17,16 @@
   "build": {
     "appId": "com.lume.fileindexer",
     "productName": "Lume",
+    "files": [
+      "dist/renderer/**/*",
+      "electron/**/*",
+      "package.json",
+      "!dist/win-unpacked/**/*",
+      "!packages*/**/*",
+      "!release/**/*"
+    ],
     "directories": {
-      "output": "packages"
+      "output": "packages-release"
     },
     "win": {
       "signAndEditExecutable": false
